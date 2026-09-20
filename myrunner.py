@@ -6,6 +6,7 @@ import argparse
 import csv
 from pathlib import Path
 import sys
+import textwrap
 
 import gymnasium as gym
 import matplotlib.pyplot as plt
@@ -110,7 +111,7 @@ def make_report(output: Path, curves: dict[float, np.ndarray], repo_url: str) ->
     sample_return = agent.calc_return(episode)
     checkpoint_index = next((i for i, (_, _, reward) in enumerate(episode, start=1) if reward > 0.5), len(episode) // 2)
     selected_renders = [sample_lines[0], sample_lines[min(checkpoint_index, len(sample_lines) - 1)], sample_lines[-1]]
-    action_trace = " ".join(f"{action}:{reward:+.2f}" for _, action, reward in episode)
+    action_trace = "\n".join(textwrap.wrap(" ".join(f"{action}:{reward:+.2f}" for _, action, reward in episode), width=86))
     env.close()
 
     with PdfPages(output / "report.pdf") as pdf:
@@ -157,11 +158,11 @@ def make_report(output: Path, curves: dict[float, np.ndarray], repo_url: str) ->
         fig = plt.figure(figsize=(8.5, 11))
         fig.text(0.08, 0.94, "Sample greedy episode", fontsize=18, weight="bold")
         fig.text(0.08, 0.90, f"Reached destination: {success}. Return: {sample_return:.3f}. Each item is action:reward.", fontsize=10)
-        fig.text(0.08, 0.86, action_trace, family="monospace", fontsize=7, wrap=True, va="top")
+        fig.text(0.08, 0.86, action_trace, family="monospace", fontsize=8, va="top")
         fig.text(0.08, 0.78, "ANSI renderer snapshots: start, checkpoint, and terminal delivery", fontsize=12, weight="bold")
         y = 0.75
         for render in selected_renders:
-            fig.text(0.08, y, render, family="monospace", fontsize=5.5, va="top")
+            fig.text(0.08, y, render, family="monospace", fontsize=7, va="top")
             y -= 0.23
         pdf.savefig(fig, bbox_inches="tight")
         plt.close(fig)
