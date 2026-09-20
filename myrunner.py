@@ -236,7 +236,7 @@ def main() -> None:
     args.output.mkdir(parents=True, exist_ok=True)
     curves = run_sweep(args.episodes, seeds)
     write_csv(args.output / "returns.csv", curves)
-    make_report(args.output, curves, args.repo_url)
+    # make_report(args.output, curves, args.repo_url)
     print(f"Wrote results to {args.output}")
     print((args.output / "summary.md").read_text())
 
