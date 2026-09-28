@@ -1,242 +1,294 @@
-"""Training, checks, lambda sweep, and report generation for PA2."""
+"""Training, the lambda sweep, and the learning-curve plot for PA2.
+
+    python myrunner.py            # sweep, CSV, plot, summary table, report PDF
+    python myrunner.py --check    # self-tests (see checks.py)
+
+Every run is seeded, so the same command regenerates the same numbers.
+"""
 
 from __future__ import annotations
 
 import argparse
 import csv
+import os
+from concurrent.futures import ProcessPoolExecutor
+from dataclasses import dataclass
 from pathlib import Path
-import sys
-import textwrap
 
 import gymnasium as gym
 import matplotlib.pyplot as plt
 import numpy as np
-from matplotlib.backends.backend_pdf import PdfPages
 
-import myenv
-from myagent import RandomAgent, SarsaLambdaAgent
+import myenv  # noqa: F401  (importing registers the environment id)
+import report
+from myagent import ACCUMULATING, REPLACING, SarsaLambdaAgent
 
+ENV_ID = "cs272/CourierRoute-v0"
 LAMBDA_VALUES = (0.0, 0.3, 0.6, 0.9, 1.0)
-DEFAULT_SEEDS = (11, 22, 33, 44, 55)
-TARGET_RETURN = 9.0
+DEFAULT_SEEDS = (11, 22, 33, 44, 55, 66, 77, 88, 99, 110)
+HYPERPARAMS = {"gamma": 0.99, "alpha": 0.08, "eps": 0.10, "init_val": 1.0}
+
+TARGET_RETURN = 9.0     # the "reached" threshold used in the table
+SMOOTH_WINDOW = 100     # trailing moving-average window used for curves and table
+ZOOM_WINDOW = 10        # finer window for the early-learning panel of the plot
+ZOOM_EPISODES = 200
+DIP_AFTER = 500         # stability is judged on the curve after this episode
+CREDIT_STEPS = (1, 3, 5, 11)  # steps back shown in the credit table; 5 and 11 are the first decision to the pickup and delivery errors
+SAMPLE_SEED = 123       # seed of the agent that produces the report's sample episode
+
+# Categorical slots in fixed order (blue, orange, aqua, yellow, magenta),
+# validated for colour-vision-deficiency separation.
+LAMBDA_COLORS = ("#2a78d6", "#eb6834", "#1baf7a", "#eda100", "#e87ba4")
 
 
-def make_env(render_mode: str | None = None):
-    return gym.make("cs272/CourierRoute-v0", render_mode=render_mode)
+def make_env(render_mode: str | None = None) -> gym.Env:
+    return gym.make(ENV_ID, render_mode=render_mode)
 
 
-def rolling_mean(values: np.ndarray, window: int = 100) -> np.ndarray:
-    if len(values) < window:
-        return np.cumsum(values) / np.arange(1, len(values) + 1)
-    result = np.empty(len(values))
-    result[: window - 1] = np.cumsum(values[: window - 1]) / np.arange(1, window)
-    result[window - 1 :] = np.convolve(values, np.ones(window) / window, mode="valid")
-    return result
+# ---------------------------------------------------------------- training
 
-
-def run_sweep(episodes: int, seeds: tuple[int, ...]) -> dict[float, np.ndarray]:
-    curves: dict[float, np.ndarray] = {}
-    for lam in LAMBDA_VALUES:
-        runs = []
-        for seed in seeds:
-            env = make_env()
-            agent = SarsaLambdaAgent(
-                env, gamma=0.99, alpha=0.08, eps=0.10, lam=lam,
-                trace="accumulating", total_epi=episodes, init_val=1.0, seed=seed,
-            )
-            runs.append(np.asarray(agent.learn(), dtype=float))
-            env.close()
-        curves[lam] = np.asarray(runs)
-    return curves
-
-
-def first_reach(curve: np.ndarray, target: float = TARGET_RETURN, window: int = 100) -> int | None:
-    smooth = rolling_mean(curve, window)
-    reached = np.flatnonzero(smooth >= target)
-    return None if len(reached) == 0 else int(reached[0] + 1)
-
-
-def write_csv(path: Path, curves: dict[float, np.ndarray]) -> None:
-    with path.open("w", newline="") as handle:
-        writer = csv.writer(handle)
-        writer.writerow(["lambda", "seed_run", "episode", "return"])
-        for lam, runs in curves.items():
-            for run_number, run in enumerate(runs):
-                for episode, value in enumerate(run, start=1):
-                    writer.writerow([lam, run_number, episode, value])
-
-
-def make_plot(curves: dict[float, np.ndarray], path: Path) -> None:
-    fig, ax = plt.subplots(figsize=(10, 6))
-    for lam, runs in curves.items():
-        smoothed = np.asarray([rolling_mean(run) for run in runs])
-        x = np.arange(1, smoothed.shape[1] + 1)
-        mean, low, high = smoothed.mean(axis=0), smoothed.min(axis=0), smoothed.max(axis=0)
-        ax.plot(x, mean, label=f"λ={lam:g}")
-        ax.fill_between(x, low, high, alpha=0.12)
-    ax.axhline(TARGET_RETURN, color="black", linestyle=":", linewidth=1, label=f"target={TARGET_RETURN:g}")
-    ax.set(title="Courier Route SARSA(λ)", xlabel="Episode", ylabel="Return, 100-episode moving average")
-    ax.grid(alpha=0.25)
-    ax.legend(ncol=3)
-    fig.tight_layout()
-    fig.savefig(path, dpi=180)
-    plt.close(fig)
-
-
-def summary_rows(curves: dict[float, np.ndarray]) -> list[tuple[float, int | None, float]]:
-    rows = []
-    for lam, runs in curves.items():
-        mean_curve = runs.mean(axis=0)
-        rows.append((lam, first_reach(mean_curve), float(runs[:, -100:].mean())))
-    return rows
-
-
-def make_report(output: Path, curves: dict[float, np.ndarray], repo_url: str) -> None:
-    plot_path = output / "lambda_sweep.png"
-    make_plot(curves, plot_path)
-    rows = summary_rows(curves)
-    env = make_env(render_mode="ansi")
-    env.reset(seed=123)
-    initial_map = env.unwrapped.render()
-    agent = SarsaLambdaAgent(env, gamma=0.99, alpha=0.08, eps=0.10, lam=0.9,
-                             total_epi=len(next(iter(curves.values()))[0]), init_val=1.0, seed=123)
-    agent.learn()
-    episode, success = agent.best_run()
-    sample_lines = []
-    env.reset(seed=123)
-    sample_lines.append(env.unwrapped.render())
-    for state, action, reward in episode:
-        env.step(action)
-        sample_lines.append(env.unwrapped.render())
-    sample_return = agent.calc_return(episode)
-    checkpoint_index = next((i for i, (_, _, reward) in enumerate(episode, start=1) if reward > 0.5), len(episode) // 2)
-    selected_renders = [sample_lines[0], sample_lines[min(checkpoint_index, len(sample_lines) - 1)], sample_lines[-1]]
-    action_trace = "\n".join(textwrap.wrap(" ".join(f"{action}:{reward:+.2f}" for _, action, reward in episode), width=86))
+def train(lam: float, seed: int, episodes: int, trace: str = ACCUMULATING) -> np.ndarray:
+    """Train one SARSA(lambda) agent and return its per-episode returns."""
+    env = make_env()
+    agent = SarsaLambdaAgent(env, lam=lam, trace=trace, total_epi=episodes, seed=seed, **HYPERPARAMS)
+    returns = agent.learn()
     env.close()
+    return np.asarray(returns, dtype=float)
 
-    with PdfPages(output / "report.pdf") as pdf:
-        fig = plt.figure(figsize=(8.5, 11))
-        fig.text(0.08, 0.94, "CS272 PA2: Courier Route and SARSA(λ)", fontsize=20, weight="bold")
-        fig.text(0.08, 0.90, "Repository", fontsize=11, weight="bold")
-        fig.text(0.08, 0.875, repo_url, fontsize=9, color="blue", url=repo_url)
-        fig.text(0.08, 0.82, "Environment summary", fontsize=14, weight="bold")
-        fig.text(0.08, 0.79, "The courier starts at the depot, collects a package at the center checkpoint, and delivers it at the lower-right destination. Each movement has a 15% perpendicular slip probability. The task rewards reaching both milestones while penalizing long routes.", wrap=True, fontsize=10, va="top")
-        fig.text(0.08, 0.68, "State diagram and initial ANSI rendering", fontsize=14, weight="bold")
-        fig.text(0.08, 0.65, "Stage 0: state = row*7 + column. Reach C to enter Stage 1.\nStage 1: state = 49 + row*7 + column. Reach D to terminate.\n\n" + initial_map, family="monospace", fontsize=8, va="top")
-        pdf.savefig(fig, bbox_inches="tight")
-        plt.close(fig)
 
-        fig, ax = plt.subplots(figsize=(10, 6))
-        for lam, runs in curves.items():
-            smoothed = np.asarray([rolling_mean(run) for run in runs])
-            x = np.arange(1, smoothed.shape[1] + 1)
-            mean, low, high = smoothed.mean(axis=0), smoothed.min(axis=0), smoothed.max(axis=0)
-            ax.plot(x, mean, label=f"λ={lam:g}")
-            ax.fill_between(x, low, high, alpha=0.12)
-        ax.axhline(TARGET_RETURN, color="black", linestyle=":", linewidth=1)
-        ax.set(title="Courier Route SARSA(λ)", xlabel="Episode", ylabel="Return, 100-episode moving average")
-        ax.grid(alpha=0.25)
-        ax.legend(ncol=3)
-        pdf.savefig(fig, bbox_inches="tight")
-        plt.close(fig)
+def _train_job(job: tuple[float, int, int, str]) -> np.ndarray:
+    return train(*job)
 
-        fig = plt.figure(figsize=(8.5, 11))
-        fig.text(0.08, 0.94, "Lambda sweep results", fontsize=18, weight="bold")
-        fig.text(0.08, 0.90, f"Target: smoothed mean return >= {TARGET_RETURN:g}. Each cell uses the mean over five seeded runs.", fontsize=10)
-        table_data = [[f"{lam:g}", "not reached" if first is None else str(first), f"{final:.3f}"] for lam, first, final in rows]
-        table_ax = fig.add_axes([0.08, 0.70, 0.84, 0.15])
-        table_ax.axis("off")
-        table = table_ax.table(cellText=table_data, colLabels=["λ", "First episode at target", "Mean final return"], loc="center", cellLoc="center", bbox=(0, 0, 1, 1))
-        table.auto_set_font_size(False)
-        table.set_fontsize(10)
-        explanation = ("Eligibility traces distribute a temporal-difference error backward over recently visited state-action pairs. In this environment, the checkpoint reward is about six moves from the start, and the delivery reward is about six more moves after the checkpoint. With λ=0, each reward mainly updates the immediately preceding action, so information travels backward slowly across many episodes. Larger λ values send useful reward information farther back in the same episode, which can speed learning. Very large λ can also propagate noisy slips and boundary moves farther, so the best value depends on the noise, step penalty, and learning rate.")
-        fig.text(0.08, 0.61, "Why λ changes the learning curve", fontsize=14, weight="bold")
-        fig.text(0.08, 0.58, explanation, fontsize=10, wrap=True, va="top")
-        pdf.savefig(fig, bbox_inches="tight")
-        plt.close(fig)
 
-        fig = plt.figure(figsize=(8.5, 11))
-        fig.text(0.08, 0.94, "Sample greedy episode", fontsize=18, weight="bold")
-        fig.text(0.08, 0.90, f"Reached destination: {success}. Return: {sample_return:.3f}. Each item is action:reward.", fontsize=10)
-        fig.text(0.08, 0.86, action_trace, family="monospace", fontsize=8, va="top")
-        fig.text(0.08, 0.78, "ANSI renderer snapshots: start, checkpoint, and terminal delivery", fontsize=12, weight="bold")
-        y = 0.75
-        for render in selected_renders:
-            fig.text(0.08, y, render, family="monospace", fontsize=7, va="top")
-            y -= 0.23
-        pdf.savefig(fig, bbox_inches="tight")
-        plt.close(fig)
+def run_sweep(episodes: int, seeds: tuple[int, ...], workers: int = 1, trace: str = ACCUMULATING,
+              lambdas: tuple[float, ...] = LAMBDA_VALUES) -> dict[float, np.ndarray]:
+    """Train every (lambda, seed) pair. Returns {lambda: array (n_seeds, episodes)}.
 
-    (output / "summary.md").write_text(
-        "# Lambda sweep summary\n\n"
-        "| lambda | first target episode | mean final return |\n|---:|---:|---:|\n" +
-        "\n".join(f"| {lam:g} | {'not reached' if first is None else first} | {final:.3f} |" for lam, first, final in rows) +
-        "\n\nTarget: smoothed mean return >= " + str(TARGET_RETURN) + ".\n"
+    Runs are independent and individually seeded, so parallelism does not
+    change any result.
+    """
+    jobs = [(lam, seed, episodes, trace) for lam in lambdas for seed in seeds]
+    if workers <= 1:
+        results = [_train_job(job) for job in jobs]
+    else:
+        with ProcessPoolExecutor(max_workers=workers) as pool:
+            results = list(pool.map(_train_job, jobs))
+    n = len(seeds)
+    return {lam: np.asarray(results[i * n:(i + 1) * n]) for i, lam in enumerate(lambdas)}
+
+
+# ------------------------------------------------------------------ metrics
+
+def rolling_mean(values: np.ndarray, window: int = SMOOTH_WINDOW) -> np.ndarray:
+    """Trailing moving average; the first window-1 points average what exists so far."""
+    cumulative = np.cumsum(np.insert(values, 0, 0.0))
+    n = np.arange(1, len(values) + 1)
+    return (cumulative[n] - cumulative[np.maximum(n - window, 0)]) / np.minimum(n, window)
+
+
+def episodes_to_target(curve: np.ndarray, target: float = TARGET_RETURN, window: int = SMOOTH_WINDOW) -> int | None:
+    """First episode whose smoothed return reaches the target, or None."""
+    reached = np.flatnonzero(rolling_mean(curve, window) >= target)
+    return int(reached[0]) + 1 if len(reached) else None
+
+
+@dataclass
+class LambdaStats:
+    lam: float
+    n_seeds: int
+    first_mean_curve: int | None    # episodes to target on the seed-averaged curve
+    first_per_seed_mean: float      # mean/sd over the seeds that reached the target
+    first_per_seed_sd: float
+    seeds_reached: int
+    final_mean: float               # mean return of the last 100 episodes, over seeds
+    final_sd: float
+    worst_dip: float                # lowest smoothed return after episode DIP_AFTER, any seed
+
+
+def lambda_stats(lam: float, runs: np.ndarray) -> LambdaStats:
+    per_seed = [episodes_to_target(run) for run in runs]
+    reached = np.array([v for v in per_seed if v is not None], dtype=float)
+    final = runs[:, -100:].mean(axis=1)
+    late = [rolling_mean(run)[DIP_AFTER:] for run in runs]
+    return LambdaStats(
+        lam=lam,
+        n_seeds=len(runs),
+        first_mean_curve=episodes_to_target(runs.mean(axis=0)),
+        first_per_seed_mean=float(reached.mean()) if len(reached) else float("nan"),
+        first_per_seed_sd=float(reached.std()) if len(reached) else float("nan"),
+        seeds_reached=len(reached),
+        final_mean=float(final.mean()),
+        final_sd=float(final.std()),
+        worst_dip=float(min((s.min() for s in late if len(s)), default=float("nan"))),
     )
 
 
-def run_checks() -> None:
-    from gymnasium.utils.env_checker import check_env
-    env = make_env()
-    check_env(env, skip_render_check=False)
-    assert env.observation_space.n == 98 and env.action_space.n == 4
+def credit_weight(lam: float, gamma: float, steps_back: int) -> float:
+    """Share of a TD error that reaches the pair visited `steps_back` steps earlier."""
+    return (gamma * lam) ** steps_back
 
-    actions = [1, 1, 2, 2, 1, 2, 1, 2]
-    trajectories = []
-    for _ in range(2):
-        state, _ = env.reset(seed=2026)
-        trajectory = [state]
-        for action in actions:
-            state, reward, terminated, truncated, _ = env.step(action)
-            trajectory.append((state, reward, terminated, truncated))
-            if terminated or truncated:
-                break
-        trajectories.append(trajectory)
-    assert trajectories[0] == trajectories[1], "same seed did not reproduce trajectory"
 
-    outcomes = set()
-    for seed in range(30):
-        env.reset(seed=seed)
-        outcomes.add(env.step(1)[0])
-    assert len(outcomes) > 1, "environment did not demonstrate stochastic outcomes"
+def fmt_first(value: int | None) -> str:
+    return "not reached" if value is None else str(value)
 
-    # For lambda=0, a trace only changes the current pair before it decays.
-    test_env = make_env()
-    agent = SarsaLambdaAgent(test_env, lam=0.0, total_epi=3, seed=7)
-    returns = agent.learn()
-    assert len(returns) == 3 and agent.q.shape == (98, 4)
-    test_env.close()
 
-    random_env = make_env()
-    baseline = RandomAgent(random_env, total_epi=200, seed=8).learn()
-    random_env.close()
-    trained_env = make_env()
-    trained = SarsaLambdaAgent(trained_env, lam=0.9, total_epi=1000, seed=8)
-    trained_returns = trained.learn()
-    trained_env.close()
-    assert np.mean(trained_returns[-100:]) > np.mean(baseline[-100:]), "trained agent did not beat baseline"
+# ------------------------------------------------------------------ outputs
+
+def write_csv(path: Path, curves: dict[float, np.ndarray], seeds: tuple[int, ...]) -> None:
+    with path.open("w", newline="") as handle:
+        writer = csv.writer(handle)
+        writer.writerow(["lambda", "seed", "episode", "return"])
+        for lam, runs in curves.items():
+            for seed, run in zip(seeds, runs):
+                for episode, value in enumerate(run, start=1):
+                    writer.writerow([f"{lam:g}", seed, episode, f"{value:.2f}"])
+
+
+def _band(ax: plt.Axes, x: np.ndarray, runs: np.ndarray, window: int, color: str, label: str) -> None:
+    smoothed = np.asarray([rolling_mean(run, window) for run in runs])
+    mean, sd = smoothed.mean(axis=0), smoothed.std(axis=0)
+    ax.plot(x, mean, color=color, linewidth=1.8, label=label)
+    ax.fill_between(x, mean - sd, mean + sd, color=color, alpha=0.15, linewidth=0)
+
+
+def make_plot(curves: dict[float, np.ndarray], path: Path) -> None:
+    """Learning curves, one line per lambda, band = +/- 1 sd across seeds.
+
+    Top: the whole run with the 100-episode window. Bottom: the first episodes
+    with a 10-episode window, because every lambda has learned the route within
+    a few hundred episodes and the full-run panel compresses that part.
+    """
+    n_seeds, episodes = next(iter(curves.values())).shape
+    zoom = min(ZOOM_EPISODES, episodes)
+    fig, (top, bottom) = plt.subplots(2, 1, figsize=(9, 8.6), constrained_layout=True)
+    for (lam, runs), color in zip(curves.items(), LAMBDA_COLORS):
+        _band(top, np.arange(1, episodes + 1), runs, SMOOTH_WINDOW, color, f"λ = {lam:g}")
+        _band(bottom, np.arange(1, zoom + 1), runs[:, :zoom], ZOOM_WINDOW, color, f"λ = {lam:g}")
+
+    for ax, title, window in ((top, "Full run", SMOOTH_WINDOW), (bottom, f"First {zoom} episodes", ZOOM_WINDOW)):
+        ax.axhline(TARGET_RETURN, color="#52514e", linestyle=":", linewidth=1, label=f"target = {TARGET_RETURN:g}")
+        ax.set_title(f"{title} ({window}-episode moving average)", loc="left", fontsize=11)
+        ax.set_xlim(0, ax.get_lines()[0].get_xdata()[-1])
+        ax.set_xlabel("Episode")
+        ax.set_ylabel("Return per episode")
+        ax.grid(alpha=0.25, linewidth=0.6)
+        for side in ("top", "right"):
+            ax.spines[side].set_visible(False)
+    top.set_ylim(4, 11.5)
+    for ax in (top, bottom):
+        ax.legend(ncol=3, loc="lower right", frameon=False, fontsize=9)
+    fig.suptitle(f"Courier Route: SARSA(λ) learning curves (mean of {n_seeds} seeds, band = ±1 sd)", fontsize=12)
+    fig.savefig(path, dpi=200)
+    plt.close(fig)
+
+
+def _summary_row(label: str, s: LambdaStats) -> str:
+    return (f"| {label} | {fmt_first(s.first_mean_curve)} | {s.first_per_seed_mean:.0f} ± {s.first_per_seed_sd:.0f} "
+            f"({s.seeds_reached}/{s.n_seeds} seeds) | {s.final_mean:.3f} ± {s.final_sd:.3f} | {s.worst_dip:.2f} |")
+
+
+def write_summary(path: Path, stats: list[LambdaStats], ablation: LambdaStats,
+                  seeds: tuple[int, ...], episodes: int) -> None:
+    header = [
+        "| lambda | episodes to target (mean curve) | episodes to target (per seed, mean ± sd) | "
+        f"mean final return (last 100) | worst {SMOOTH_WINDOW}-episode mean after episode {DIP_AFTER} |",
+        "|---:|---:|---:|---:|---:|",
+    ]
+    lines = [
+        "# Lambda sweep summary", "",
+        f"Target: {SMOOTH_WINDOW}-episode moving average of the return >= {TARGET_RETURN:g}. "
+        f"{len(seeds)} seeds ({', '.join(map(str, seeds))}), {episodes} episodes each, "
+        f"hyperparameters {HYPERPARAMS}, accumulating traces.", "",
+        *header, *(_summary_row(f"{s.lam:g}", s) for s in stats), "",
+        "Ablation, lambda = 1 with replacing traces:", "",
+        *header, _summary_row("1 (replacing)", ablation),
+    ]
+    path.write_text("\n".join(lines) + "\n")
+
+
+# ------------------------------------------------------------ sample episode
+
+@dataclass
+class SampleEpisode:
+    lam: float
+    seed: int
+    episodes_trained: int
+    frames: list[str]           # ansi render before the first step, then after each step
+    actions: list[int]
+    rewards: list[float]
+    total_return: float
+    reached_destination: bool
+
+
+def sample_episode(lam: float, episodes: int, seed: int = SAMPLE_SEED) -> SampleEpisode:
+    """Train one agent, then record one greedy episode with the ansi renderer.
+
+    The episode is generated once and replayed under the same reset seed, so the
+    rendered frames are exactly the transitions whose rewards are reported.
+    """
+    env = make_env(render_mode="ansi")
+    agent = SarsaLambdaAgent(env, lam=lam, total_epi=episodes, seed=seed, **HYPERPARAMS)
+    agent.learn()
+    reset_seed = seed + 1
+    episode, reached = agent.best_run(reset_seed=reset_seed)
+
+    env.reset(seed=reset_seed)
+    frames = [env.unwrapped.render()]
+    for _, action, reward in episode:
+        _, replay_reward, *_ = env.step(action)
+        assert abs(replay_reward - reward) < 1e-12, "replay diverged from the recorded episode"
+        frames.append(env.unwrapped.render())
     env.close()
-    print("All checks passed.")
+    return SampleEpisode(lam, seed, episodes, frames, [a for _, a, _ in episode], [r for *_, r in episode],
+                         agent.calc_return(episode), reached)
+
+
+# --------------------------------------------------------------------- main
+
+def default_workers() -> int:
+    return max(1, min(os.cpu_count() or 1, 8))
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--check", action="store_true")
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("--check", action="store_true", help="run the self-tests and exit")
     parser.add_argument("--episodes", type=int, default=5000)
-    parser.add_argument("--seeds", type=int, default=5)
+    parser.add_argument("--seeds", type=int, default=len(DEFAULT_SEEDS), help="number of seeds per lambda (at least 5)")
     parser.add_argument("--output", type=Path, default=Path("results"))
-    parser.add_argument("--repo-url", default="https://github.com/REPLACE_WITH_YOUR_PUBLIC_REPOSITORY")
+    parser.add_argument("--workers", type=int, default=default_workers(), help="parallel training processes")
+    parser.add_argument("--repo-url", default="https://github.com/Kushagrabainsla/cs272-pa2-gym")
     args = parser.parse_args()
+
     if args.check:
-        run_checks()
+        import checks
+        checks.run_all()
         return
-    if args.episodes <= 0 or args.seeds <= 0:
-        raise ValueError("episodes and seeds must be positive")
-    seeds = DEFAULT_SEEDS[:args.seeds] if args.seeds <= len(DEFAULT_SEEDS) else tuple(range(11, 11 + args.seeds))
+    if args.episodes < SMOOTH_WINDOW or args.seeds < 1:
+        raise SystemExit(f"need --episodes >= {SMOOTH_WINDOW} and --seeds >= 1")
+    seeds = DEFAULT_SEEDS[:args.seeds] if args.seeds <= len(DEFAULT_SEEDS) else tuple(11 * k for k in range(1, args.seeds + 1))
+
     args.output.mkdir(parents=True, exist_ok=True)
-    curves = run_sweep(args.episodes, seeds)
-    write_csv(args.output / "returns.csv", curves)
-    # make_report(args.output, curves, args.repo_url)
+    curves = run_sweep(args.episodes, seeds, args.workers)
+    ablation_runs = run_sweep(args.episodes, seeds, args.workers, trace=REPLACING, lambdas=(1.0,))[1.0]
+
+    stats = [lambda_stats(lam, runs) for lam, runs in curves.items()]
+    ablation = lambda_stats(1.0, ablation_runs)
+    write_csv(args.output / "returns.csv", curves, seeds)
+    make_plot(curves, args.output / "lambda_sweep.png")
+    write_summary(args.output / "summary.md", stats, ablation, seeds, args.episodes)
+
+    reached = [s for s in stats if s.first_mean_curve is not None]
+    best = min(reached, key=lambda s: s.first_mean_curve) if reached else stats[0]
+    sample = sample_episode(best.lam, args.episodes)
+
+    settings = {
+        "hyperparams": HYPERPARAMS, "target": TARGET_RETURN, "window": SMOOTH_WINDOW, "zoom_window": ZOOM_WINDOW,
+        "dip_after": DIP_AFTER, "credit_steps": CREDIT_STEPS,
+        "credit": {lam: [credit_weight(lam, HYPERPARAMS["gamma"], k) for k in CREDIT_STEPS] for lam in LAMBDA_VALUES},
+    }
+    report.write_report(args.output / "report.pdf", repo_url=args.repo_url, plot_png=args.output / "lambda_sweep.png",
+                        stats=stats, ablation=ablation, sample=sample, seeds=seeds, episodes=args.episodes,
+                        settings=settings)
     print(f"Wrote results to {args.output}")
     print((args.output / "summary.md").read_text())
 
