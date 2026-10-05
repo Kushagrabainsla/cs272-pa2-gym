@@ -2,16 +2,27 @@
 
 from __future__ import annotations
 
+from enum import IntEnum
+
 import numpy as np
 import gymnasium as gym
 from gymnasium import spaces
 from gymnasium.envs.registration import register
 
 
+class Action(IntEnum):
+    """Direction the courier can move in the warehouse."""
+    UP = 0
+    RIGHT = 1
+    DOWN = 2
+    LEFT = 3
+
+
 class CourierRouteEnv(gym.Env):
     """Navigate a courier through a seven by seven warehouse map."""
 
     metadata = {"render_modes": ["ansi"], "render_fps": 4}
+    Action = Action
     SIZE = 7
     N_CELLS = SIZE * SIZE
     N_STATES = N_CELLS * 2
@@ -35,6 +46,32 @@ class CourierRouteEnv(gym.Env):
     @classmethod
     def encode(cls, row: int, col: int, stage: int) -> int:
         return stage * cls.N_CELLS + row * cls.SIZE + col
+
+    @classmethod
+    def decode(cls, state: int) -> tuple[int, int, int]:
+        """Decode a discrete state integer into (row, col, stage).
+
+        Args:
+            state: encoded integer state in [0, N_STATES - 1]
+
+        Returns:
+            tuple[int, int, int]: (row, col, stage)
+        """
+        stage = state // cls.N_CELLS
+        rem = state % cls.N_CELLS
+        row = rem // cls.SIZE
+        col = rem % cls.SIZE
+        return row, col, stage
+
+    @classmethod
+    def is_valid_coord(cls, row: int, col: int) -> bool:
+        """Check whether (row, col) is within the warehouse floor grid."""
+        return 0 <= row < cls.SIZE and 0 <= col < cls.SIZE
+
+    @classmethod
+    def manhattan_distance(cls, r1: int, c1: int, r2: int, c2: int) -> int:
+        """Calculate the Manhattan distance between two grid coordinates."""
+        return abs(r1 - r2) + abs(c1 - c2)
 
     def _get_obs(self) -> int:
         return self.encode(self.row, self.col, self.stage)
