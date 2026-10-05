@@ -1,0 +1,26 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "cs272-pa2-gym"
+version = "0.1.0"
+description = "CS 272 Programming Assignment 2: Courier Route Gym Environment and SARSA(lambda) Agent"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "gymnasium==1.2.1",
+    "numpy>=2.0",
+    "matplotlib>=3.8",
+    "reportlab>=4.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "pypdf>=5.0",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-v"
