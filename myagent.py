@@ -46,6 +46,8 @@ class SarsaLambdaAgent:
         total_epi: int = 5_000,
         init_val: float = 1.0,
         seed: int | None = None,
+        eps_decay: float = 1.0,
+        min_eps: float = 0.0,
     ) -> None:
         """
         Args:
@@ -60,6 +62,8 @@ class SarsaLambdaAgent:
             init_val: value every q(s,a) starts at.
             seed: seed for the agent's own randomness and, once at the start of
                 learn(), for the environment's. Same seed, same learning curve.
+            eps_decay: factor multiplied to epsilon after each episode (default: 1.0).
+            min_eps: floor value for decayed exploration rate (default: 0.0).
         """
         if trace not in (ACCUMULATING, REPLACING):
             raise ValueError(f"unknown trace type: {trace}")
@@ -67,6 +71,8 @@ class SarsaLambdaAgent:
             raise ValueError("alpha must be in (0, 1]")
         if not (0.0 <= gamma <= 1.0 and 0.0 <= lam <= 1.0 and 0.0 <= eps <= 1.0):
             raise ValueError("gamma, lam, and eps must be in [0, 1]")
+        if not (0.0 <= eps_decay <= 1.0 and 0.0 <= min_eps <= 1.0):
+            raise ValueError("eps_decay and min_eps must be in [0, 1]")
 
         self.env = env
         self.n_states = env.observation_space.n
@@ -79,6 +85,9 @@ class SarsaLambdaAgent:
         self.total_epi = total_epi
         self.init_val = init_val
         self.seed = seed
+        self.eps_decay = eps_decay
+        self.min_eps = min_eps
+        self.current_eps = eps
 
         self.rng = np.random.default_rng(seed)
         self.q = self.init_qtable(init_val)
@@ -98,9 +107,40 @@ class SarsaLambdaAgent:
         Returns:
             int: an action
         """
-        if exploration and self.rng.random() < self.eps:
+        threshold = self.current_eps if exploration else 0.0
+        if exploration and self.rng.random() < threshold:
             return int(self.rng.integers(self.n_actions))
         return argmax_action(self.q[int(state)], self.rng)
+
+    def _update_trace(self, traces: np.ndarray, state: int, action: int) -> None:
+        """Update eligibility trace for state-action pair based on trace mechanism."""
+        if self.trace == REPLACING:
+            traces[state, action] = 1.0
+        else:
+            traces[state, action] += 1.0
+
+    def _compute_td_error(
+        self,
+        reward: float,
+        next_state: int,
+        next_action: int | None,
+        state: int,
+        action: int,
+        terminated: bool,
+    ) -> float:
+        """Compute the TD error delta for the transition."""
+        if terminated:
+            return reward - self.q[state, action]
+        assert next_action is not None
+        return reward + self.gamma * self.q[next_state, next_action] - self.q[state, action]
+
+    def get_policy(self) -> np.ndarray:
+        """Extract the greedy policy array (n_states,), selecting argmax action for each state."""
+        return np.array([argmax_action(self.q[s], self.rng) for s in range(self.n_states)], dtype=int)
+
+    def get_state_values(self) -> np.ndarray:
+        """Extract state values V(s) = max_a Q(s, a) across all states."""
+        return np.max(self.q, axis=1)
 
     def learn(self) -> list[float]:
         """Run SARSA(lambda) for self.total_epi episodes, updating self.q.
@@ -136,16 +176,12 @@ class SarsaLambdaAgent:
                     # current state.
                     self.q[next_state, :] = 0.0
                     next_action = None
-                    delta = reward - self.q[state, action]
                 else:
                     # Truncation is not termination: next_state is a real state.
                     next_action = self.eps_greedy(next_state)
-                    delta = reward + self.gamma * self.q[next_state, next_action] - self.q[state, action]
 
-                if self.trace == REPLACING:
-                    traces[state, action] = 1.0
-                else:
-                    traces[state, action] += 1.0
+                delta = self._compute_td_error(reward, next_state, next_action, state, action, terminated)
+                self._update_trace(traces, state, action)
 
                 self.q += self.alpha * delta * traces
                 traces *= self.gamma * self.lam
@@ -153,6 +189,9 @@ class SarsaLambdaAgent:
                 if terminated or truncated:
                     break
                 state, action = next_state, next_action
+
+            if self.eps_decay < 1.0:
+                self.current_eps = max(self.min_eps, self.current_eps * self.eps_decay)
             returns.append(total_return)
         return returns
 
