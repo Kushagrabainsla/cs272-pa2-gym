@@ -252,43 +252,72 @@ def default_workers() -> int:
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--check", action="store_true", help="run the self-tests and exit")
-    parser.add_argument("--episodes", type=int, default=5000)
-    parser.add_argument("--seeds", type=int, default=len(DEFAULT_SEEDS), help="number of seeds per lambda (at least 5)")
-    parser.add_argument("--output", type=Path, default=Path("results"))
+    parser.add_argument("--episodes", type=int, default=5000, help="number of training episodes per run")
+    parser.add_argument("--seeds", type=int, default=len(DEFAULT_SEEDS), help="number of seeds per lambda (at least 1)")
+    parser.add_argument("--seeds-list", type=str, default=None, help="comma-separated list of explicit seeds (e.g. '11,22,33')")
+    parser.add_argument("--trace", type=str, default=ACCUMULATING, choices=[ACCUMULATING, REPLACING],
+                        help="eligibility trace mechanism (default: accumulating)")
+    parser.add_argument("--lambdas", type=str, default=None, help="comma-separated lambda values (e.g. '0.0,0.5,1.0')")
+    parser.add_argument("--no-pdf", action="store_true", help="skip generating the PDF report")
+    parser.add_argument("--no-plot", action="store_true", help="skip generating the lambda sweep PNG plot")
+    parser.add_argument("--output", type=Path, default=Path("results"), help="output directory for artifacts")
     parser.add_argument("--workers", type=int, default=default_workers(), help="parallel training processes")
-    parser.add_argument("--repo-url", default="https://github.com/Kushagrabainsla/cs272-pa2-gym")
+    parser.add_argument("--repo-url", default="https://github.com/Kushagrabainsla/cs272-pa2-gym", help="URL for report link")
     args = parser.parse_args()
 
     if args.check:
         import checks
         checks.run_all()
         return
-    if args.episodes < SMOOTH_WINDOW or args.seeds < 1:
-        raise SystemExit(f"need --episodes >= {SMOOTH_WINDOW} and --seeds >= 1")
-    seeds = DEFAULT_SEEDS[:args.seeds] if args.seeds <= len(DEFAULT_SEEDS) else tuple(11 * k for k in range(1, args.seeds + 1))
+    if args.episodes < SMOOTH_WINDOW:
+        raise SystemExit(f"need --episodes >= {SMOOTH_WINDOW}")
+
+    if args.seeds_list is not None:
+        try:
+            seeds = tuple(int(s.strip()) for s in args.seeds_list.split(",") if s.strip())
+            if not seeds:
+                raise ValueError("empty seeds list")
+        except ValueError as err:
+            raise SystemExit(f"invalid --seeds-list: {err}")
+    else:
+        if args.seeds < 1:
+            raise SystemExit("need --seeds >= 1")
+        seeds = DEFAULT_SEEDS[:args.seeds] if args.seeds <= len(DEFAULT_SEEDS) else tuple(11 * k for k in range(1, args.seeds + 1))
+
+    lambdas = LAMBDA_VALUES
+    if args.lambdas is not None:
+        try:
+            lambdas = tuple(float(x.strip()) for x in args.lambdas.split(",") if x.strip())
+            if not lambdas:
+                raise ValueError("empty lambda list")
+        except ValueError as err:
+            raise SystemExit(f"invalid --lambdas: {err}")
 
     args.output.mkdir(parents=True, exist_ok=True)
-    curves = run_sweep(args.episodes, seeds, args.workers)
+    curves = run_sweep(args.episodes, seeds, args.workers, trace=args.trace, lambdas=lambdas)
     ablation_runs = run_sweep(args.episodes, seeds, args.workers, trace=REPLACING, lambdas=(1.0,))[1.0]
 
     stats = [lambda_stats(lam, runs) for lam, runs in curves.items()]
     ablation = lambda_stats(1.0, ablation_runs)
     write_csv(args.output / "returns.csv", curves, seeds)
-    make_plot(curves, args.output / "lambda_sweep.png")
+    if not args.no_plot:
+        make_plot(curves, args.output / "lambda_sweep.png")
     write_summary(args.output / "summary.md", stats, ablation, seeds, args.episodes)
 
-    reached = [s for s in stats if s.first_mean_curve is not None]
-    best = min(reached, key=lambda s: s.first_mean_curve) if reached else stats[0]
-    sample = sample_episode(best.lam, args.episodes)
+    if not args.no_pdf:
+        reached = [s for s in stats if s.first_mean_curve is not None]
+        best = min(reached, key=lambda s: s.first_mean_curve) if reached else stats[0]
+        sample = sample_episode(best.lam, args.episodes)
 
-    settings = {
-        "hyperparams": HYPERPARAMS, "target": TARGET_RETURN, "window": SMOOTH_WINDOW, "zoom_window": ZOOM_WINDOW,
-        "dip_after": DIP_AFTER, "credit_steps": CREDIT_STEPS,
-        "credit": {lam: [credit_weight(lam, HYPERPARAMS["gamma"], k) for k in CREDIT_STEPS] for lam in LAMBDA_VALUES},
-    }
-    report.write_report(args.output / "report.pdf", repo_url=args.repo_url, plot_png=args.output / "lambda_sweep.png",
-                        stats=stats, ablation=ablation, sample=sample, seeds=seeds, episodes=args.episodes,
-                        settings=settings)
+        settings = {
+            "hyperparams": HYPERPARAMS, "target": TARGET_RETURN, "window": SMOOTH_WINDOW, "zoom_window": ZOOM_WINDOW,
+            "dip_after": DIP_AFTER, "credit_steps": CREDIT_STEPS,
+            "credit": {lam: [credit_weight(lam, HYPERPARAMS["gamma"], k) for k in CREDIT_STEPS] for lam in lambdas},
+        }
+        report.write_report(args.output / "report.pdf", repo_url=args.repo_url, plot_png=args.output / "lambda_sweep.png",
+                            stats=stats, ablation=ablation, sample=sample, seeds=seeds, episodes=args.episodes,
+                            settings=settings)
+
     print(f"Wrote results to {args.output}")
     print((args.output / "summary.md").read_text())
 
